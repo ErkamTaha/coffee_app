@@ -26,8 +26,8 @@ progresses.
 | 4 | Orders & payments | ✅ Done |
 | 5 | Discounts & promotions | ✅ Done |
 | 6 | Inventory (movement ledger) | ✅ Done |
-| 7 | Cash drawer & shifts | ⏳ Next |
-| 8 | Auth & permissions | ☐ Planned |
+| 7 | Cash drawer & shifts | ✅ Done |
+| 8 | Auth & permissions | ⏳ Next |
 | 9 | Cross-cutting (constraints, indexes, sync layer) | ☐ Planned |
 | 10 | Migrations & seed data | ☐ Planned |
 
@@ -60,6 +60,11 @@ progresses.
 | D21 | Movement types | **Full set** | sale, restock, waste, transfer_in/out, count_adjustment, return. DB CHECK enforces the sign per type. Rejected minimal (no waste/transfers). |
 | D22 | Stock-on-hand storage | **Derived cache `stock_balances` + trigger** | Projection of the ledger → O(1) reads; rebuildable from movements (ledger = source of truth). Rejected compute-on-read (slows as ledger grows). |
 | D23 | Costing | **Capture cost on restocks + moving average** | Store `unit_cost_cents` on restocks (offline-safe raw data); compute moving-average COGS server-side in reporting. Rejected FIFO/lot (overkill) and no-costing (no margins). |
+| D24 | Reconciliation unit | **Terminal drawer session** | Reconcile the till as a unit; one open session per terminal, enforced by a partial unique index. Record who opened/closed and stamp each payment with its user, but don't split the float per cashier. Rejected per-cashier sessions (workflow overhead, assumes assigned drawers). |
+| D25 | Step 7 scope | **Cash reconciliation only** | Till session + over/short now; employee timeclock/labor is a separate concern deferred to its own step. Rejected bundling HR/payroll into cash accountability. |
+| D26 | Cash sales source | **Derive from `payments`** | Link each payment to its session (`payments.cash_drawer_session_id`); compute expected cash from cash payments/refunds + the cash ledger. Single source of truth for sales. Rejected duplicating sales into the cash ledger (two places to keep in sync). |
+| D27 | Opening float vs movements | **Float = column; pay-in/out/drop = ledger** | Exactly one opening float per session → a column. Mid-shift cash events go in the append-only `cash_movements` ledger (same archetype as `stock_movements`). `pay_out`/`drop` require a reason (anti-shrinkage), like ad-hoc discounts. |
+| D28 | Reconciliation totals | **Frozen at close + DB CHECK** | `expected_cash`/`counted_cash`/`over_short` are snapshotted when the drawer closes; CHECK enforces `over_short = counted − expected` and a status-gated CHECK requires closed sessions to be fully populated (and open ones to be blank). Rejected compute-on-read (money snapshot must be frozen). |
 
 ---
 
@@ -640,6 +645,113 @@ DO UPDATE SET quantity_on_hand = stock_balances.quantity_on_hand + NEW.quantity_
 
 ---
 
+## Step 7 — Cash drawer & shifts
+
+**Core idea:** give the physical cash in a register **accountability**. A drawer is
+*opened* with a starting **float**, transactions flow through it, then it's *closed* —
+someone counts the cash and the system compares it to what *should* be there. The number
+that matters is **over/short** (`counted − expected`): it surfaces theft, till errors,
+and miscounts, and underpins X/Z register reports.
+
+```
+cash_drawer_sessions   the open→closed till session (float, expected, counted, over/short)
+  └── cash_movements    append-only ledger of NON-sale cash events (pay-in / pay-out / drop)
+payments.cash_drawer_session_id   links each sale's tender to its session (cash sales derived, not duplicated)
+```
+
+Expected cash is **derived, never duplicated** (D26):
+```
+expected = opening_float
+         + Σ cash payments  − Σ cash refunds          (from `payments`, method='cash')
+         + Σ pay_in         − Σ (pay_out + drop)       (from `cash_movements`)
+over_short = counted − expected
+```
+
+Key points:
+- **Terminal drawer session (D24):** reconciliation is per register, not per cashier. A
+  **partial unique index guarantees at most one open session per terminal** — the DB
+  itself prevents two drawers open on one register. `opened_by`/`closed_by` record
+  accountability without splitting the float per person.
+- **Float is a column; cash events are a ledger (D27):** exactly one opening float per
+  session → a column. Mid-shift cash in/out lives in `cash_movements`, the same
+  append-only **event-log archetype** as `stock_movements` (Step 6) — amounts are
+  positive and `type` gives direction. `pay_out`/`drop` require a `reason` (anti-shrinkage),
+  mirroring ad-hoc discounts.
+- **Frozen reconciliation (D28):** `expected_cash_cents`, `counted_cash_cents`, and
+  `over_short_cents` are snapshotted at close. A CHECK enforces the arithmetic; a
+  status-gated CHECK requires a `closed` session to be fully populated and an `open` one
+  to be blank — illegal half-closed states can't exist.
+- **Cash sales stay in `payments` (D26):** we add one nullable FK there rather than
+  re-recording sales. Card/online tender simply leaves it NULL.
+- **`business_date`** (location-local day, as in Step 4) groups sessions for daily reports.
+
+### Change to an existing table
+`payments` gains a soft link to the session it occurred in (nullable — non-drawer tender
+like online card payments has none):
+```sql
+ALTER TABLE payments
+    ADD COLUMN cash_drawer_session_id UUID REFERENCES cash_drawer_sessions(id);
+CREATE INDEX idx_payments_session ON payments(cash_drawer_session_id)
+    WHERE cash_drawer_session_id IS NOT NULL AND deleted_at IS NULL;
+```
+
+```sql
+CREATE TABLE cash_drawer_sessions (   -- entity (mutable state: open → closed)
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    location_id         UUID NOT NULL REFERENCES locations(id),
+    terminal_id         UUID NOT NULL REFERENCES terminals(id),
+    business_date       DATE NOT NULL,                       -- location-local day
+    currency            CHAR(3) NOT NULL,                    -- snapshot of location currency
+    status              TEXT NOT NULL DEFAULT 'open',
+    opening_float_cents BIGINT NOT NULL DEFAULT 0 CHECK (opening_float_cents >= 0),
+    expected_cash_cents BIGINT,        -- computed & frozen at close
+    counted_cash_cents  BIGINT,        -- entered at close
+    over_short_cents    BIGINT,        -- counted − expected, frozen at close
+    opened_by_user_id   UUID NOT NULL REFERENCES users(id),
+    closed_by_user_id   UUID REFERENCES users(id),
+    opened_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    closed_at           TIMESTAMPTZ,
+    note                TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at          TIMESTAMPTZ,
+    CONSTRAINT chk_cds_status CHECK (status IN ('open','closed')),
+    CONSTRAINT chk_cds_state CHECK (
+        (status = 'open'   AND closed_at IS NULL AND closed_by_user_id IS NULL
+                           AND expected_cash_cents IS NULL AND counted_cash_cents IS NULL
+                           AND over_short_cents IS NULL)
+     OR (status = 'closed' AND closed_at IS NOT NULL AND closed_by_user_id IS NOT NULL
+                           AND expected_cash_cents IS NOT NULL AND counted_cash_cents IS NOT NULL
+                           AND over_short_cents IS NOT NULL)
+    ),
+    CONSTRAINT chk_cds_over_short CHECK (
+        over_short_cents IS NULL OR over_short_cents = counted_cash_cents - expected_cash_cents)
+);
+
+CREATE TABLE cash_movements (   -- append-only event log: no updated_at / deleted_at
+    id                     UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    cash_drawer_session_id UUID   NOT NULL REFERENCES cash_drawer_sessions(id),
+    location_id            UUID   NOT NULL REFERENCES locations(id),
+    type                   TEXT   NOT NULL,
+    amount_cents           BIGINT NOT NULL CHECK (amount_cents > 0),  -- positive; type gives direction
+    currency               CHAR(3) NOT NULL,
+    reason                 TEXT,
+    created_by_user_id     UUID   NOT NULL REFERENCES users(id),
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_cash_movement_type   CHECK (type IN ('pay_in','pay_out','drop')),
+    CONSTRAINT chk_cash_movement_reason CHECK (type = 'pay_in' OR reason IS NOT NULL)
+);
+
+-- One open drawer per terminal — the DB enforces it
+CREATE UNIQUE INDEX uq_open_session_per_terminal
+    ON cash_drawer_sessions(terminal_id) WHERE status = 'open' AND deleted_at IS NULL;
+CREATE INDEX idx_cds_loc_date  ON cash_drawer_sessions(location_id, business_date) WHERE deleted_at IS NULL;
+CREATE INDEX idx_cds_terminal  ON cash_drawer_sessions(terminal_id)                WHERE deleted_at IS NULL;
+CREATE INDEX idx_cash_movements_session ON cash_movements(cash_drawer_session_id);
+```
+
+---
+
 ## Open items / to revisit
 - Step 9: a shared trigger to auto-maintain `updated_at` on every table.
 - Step 9: the sync/change-log layer and conflict-resolution policy.
@@ -647,7 +759,8 @@ DO UPDATE SET quantity_on_hand = stock_balances.quantity_on_hand + NEW.quantity_
 - Category nesting (self-referencing `parent_id`) — only if needed later.
 - `locations` address/contact block — add when convenient.
 - **Migration ordering:** `users` (Step 8) must be created *before* `orders`,
-  `payments`, and `order_status_history`, which reference `users(id)`.
+  `payments`, `order_status_history`, `cash_drawer_sessions`, and `cash_movements`,
+  which all reference `users(id)`.
 - Step 9: trigger to enforce `orders.subtotal_cents = sum(order_items.line_total_cents)`.
 - Step 9: trigger to enforce `orders.discount_cents = sum(order_discounts.amount_cents)`.
 - App/sync: discount eligibility (stacking, validity window, min spend) — not in schema.
@@ -655,7 +768,11 @@ DO UPDATE SET quantity_on_hand = stock_balances.quantity_on_hand + NEW.quantity_
 - Step 9: trigger to maintain `stock_balances` from `stock_movements` (upsert shown above).
 - App/sync: generating `sale` movements from order + recipe; voids/refunds append compensating movements.
 - Deferred: per-location recipe overrides; purchase-unit↔stock-unit conversions (e.g. case→each).
+- App/sync: compute `expected_cash_cents` at close (cash payments/refunds + cash ledger); stamp `payments.cash_drawer_session_id` at sale time.
+- Deferred: denomination breakdown of the counted cash (a `cash_count_lines` child of the session) — v1 stores a single counted total.
+- Deferred: employee timeclock / labor shifts (clock in/out, hours) — separate from cash reconciliation (D25).
+- App/sync: X/Z register reports = roll up `payments` (all tender) + `cash_movements` by session.
 
 ---
 
-*Last updated: through Step 6 (Inventory — movement ledger).*
+*Last updated: through Step 7 (Cash drawer & shifts).*
