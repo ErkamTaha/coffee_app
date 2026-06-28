@@ -27,8 +27,8 @@ progresses.
 | 5 | Discounts & promotions | ✅ Done |
 | 6 | Inventory (movement ledger) | ✅ Done |
 | 7 | Cash drawer & shifts | ✅ Done |
-| 8 | Auth & permissions | ⏳ Next |
-| 9 | Cross-cutting (constraints, indexes, sync layer) | ☐ Planned |
+| 8 | Auth & permissions | ✅ Done |
+| 9 | Cross-cutting (constraints, indexes, sync layer) | ⏳ Next |
 | 10 | Migrations & seed data | ☐ Planned |
 
 ---
@@ -65,6 +65,12 @@ progresses.
 | D26 | Cash sales source | **Derive from `payments`** | Link each payment to its session (`payments.cash_drawer_session_id`); compute expected cash from cash payments/refunds + the cash ledger. Single source of truth for sales. Rejected duplicating sales into the cash ledger (two places to keep in sync). |
 | D27 | Opening float vs movements | **Float = column; pay-in/out/drop = ledger** | Exactly one opening float per session → a column. Mid-shift cash events go in the append-only `cash_movements` ledger (same archetype as `stock_movements`). `pay_out`/`drop` require a reason (anti-shrinkage), like ad-hoc discounts. |
 | D28 | Reconciliation totals | **Frozen at close + DB CHECK** | `expected_cash`/`counted_cash`/`over_short` are snapshotted when the drawer closes; CHECK enforces `over_short = counted − expected` and a status-gated CHECK requires closed sessions to be fully populated (and open ones to be blank). Rejected compute-on-read (money snapshot must be frozen). |
+| D29 | User identity & auth | **Org-scoped users; PIN + password, both optional, hashed** | Staff belong to the org. PIN = fast till login; email+password = back-office; a user may have either or both. Never store plaintext. `is_active` suspends without offboarding (which is `deleted_at`). |
+| D30 | PIN vs password hashing | **PIN = deterministic keyed hash (HMAC+pepper); password = slow salted hash (argon2/bcrypt)** | PIN login looks a user up *by* the PIN and enforces uniqueness → must be deterministic + indexable. Password is fetched by email then verified → slow salted. Rejected bcrypting the PIN: salted hashes of the same PIN differ, so you couldn't look up the user or enforce PIN uniqueness. |
+| D31 | Authorization model | **RBAC: permissions ← roles ← users** | Permissions are a system-seeded global vocabulary (stable `key`); roles are org-customizable (`organization_id`). Rejected fixed system roles (too rigid for a franchise). |
+| D32 | Role assignment scope | **Location-scoped** (`user_roles.location_id`, NULL = all) | A user can be manager at one shop, cashier at another. `NULLS NOT DISTINCT` partial unique keeps the org-wide assignment singular. |
+| D33 | Per-user overrides | **`user_permissions` allow/deny on top of roles; deny wins** | Grant one barista void rights without inventing a role. Location-scoped like role assignments. |
+| D34 | Enforcement boundary & join deletes | **App enforces; schema models grants. Join tables soft-delete** | Effective permission is resolved in app/sync (the DB can't know "void *this* order"). Membership rows (`role_permissions`, `user_roles`, `user_permissions`) carry `deleted_at` so *removals* sync offline, not just additions. |
 
 ---
 
@@ -752,15 +758,153 @@ CREATE INDEX idx_cash_movements_session ON cash_movements(cash_drawer_session_id
 
 ---
 
+## Step 8 — Auth & permissions
+
+**Core idea:** split **authentication** (proving who you are) from **authorization**
+(what you may do), and finally satisfy the `*_user_id` foreign keys that orders,
+payments, history, and the cash tables have all been pointing at.
+
+```
+users ──< user_roles >── roles ──< role_permissions >── permissions
+  └────< user_permissions >───────────────────────────────┘   (per-user override)
+```
+
+### Authentication — the PIN/password split (D29, D30)
+- A POS logs staff in at the till constantly, so the fast path is a **numeric PIN**;
+  back-office uses **email + password**. A user may have either or both — both hash
+  columns are nullable. Plaintext is never stored.
+- **Two different hashing strategies, on purpose:**
+  - **`password_hash`** is a *slow salted* hash (argon2/bcrypt). Login fetches the user
+    *by email*, then verifies. Slowness resists brute force.
+  - **`pin_hash`** is a *deterministic keyed* hash (HMAC with a server-side pepper).
+    PIN login has no email — the user types `4821` and the system must find *which* user
+    that is. A salted hash can't do that (same PIN → different hash every time), so it
+    must be deterministic. That also lets a unique index enforce "no two active staff
+    share a PIN" (`uq_users_pin`, scoped per org).
+- **`is_active`** suspends a user (locked out, PIN still reserved) without offboarding;
+  `deleted_at` is the actual departure tombstone.
+
+### Authorization — RBAC with overrides (D31–D33)
+- **`permissions`** are a fixed, system-seeded vocabulary keyed by a stable string
+  (`order.void`, `discount.apply`, `drawer.open`, `cash.pay_out`, `report.view`). It's a
+  reference table — no org, no soft-delete.
+- **`roles`** are **org-customizable** (`organization_id`): each franchise builds its own
+  roles from that permission catalog via `role_permissions`.
+- **`user_roles`** assigns a role to a user **scoped to a location** — `location_id` NULL
+  means org-wide. So "manager at Branch A, cashier at Branch B" is two rows.
+- **`user_permissions`** is the escape hatch: grant or deny one permission to one user
+  (optionally per location). **Deny wins** in resolution.
+
+### Resolution (app/sync, not the DB) — D34
+```
+effective(user, permission, location):
+  by_role  = a live user_roles row (location = this location OR NULL)
+             whose role has a live role_permissions row for the permission
+  override = live user_permissions rows for (user, permission), scoped to this location OR NULL
+  if any override is 'deny'    -> DENIED      (deny always wins)
+  elif any override is 'allow' -> ALLOWED
+  else -> by_role
+```
+The DB can't evaluate "may this user void *this* order," so enforcement lives in
+app/sync — the schema's job is to model the grants (same boundary as discount eligibility).
+
+### Two Postgres details worth noting
+- **`NULLS NOT DISTINCT`** on `uq_user_roles` / `uq_user_permissions`: Postgres treats
+  NULLs as distinct by default, which would allow two org-wide (`location_id = NULL`)
+  rows for the same pair. This flag collapses them so "all locations" stays singular.
+- **Join tables carry `deleted_at`** — removing a permission from a role, or a role from
+  a user, is an event that must sync offline; a hard delete would simply vanish.
+
+```sql
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    full_name       TEXT NOT NULL,
+    email           TEXT,                 -- back-office login; optional
+    password_hash   TEXT,                 -- slow salted hash (argon2/bcrypt); looked up by email
+    pin_hash        TEXT,                 -- deterministic keyed hash (HMAC+pepper); looked up by PIN
+    is_active       BOOLEAN NOT NULL DEFAULT true,   -- suspend without offboarding
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at      TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX uq_users_email ON users(organization_id, lower(email))
+    WHERE email IS NOT NULL AND deleted_at IS NULL;
+CREATE UNIQUE INDEX uq_users_pin   ON users(organization_id, pin_hash)
+    WHERE pin_hash IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX idx_users_org ON users(organization_id) WHERE deleted_at IS NULL;
+
+CREATE TABLE permissions (   -- system-seeded reference vocabulary (no org, no soft-delete)
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    key         TEXT NOT NULL UNIQUE,     -- stable, e.g. 'order.void', 'cash.pay_out'
+    description TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE roles (   -- org-customizable
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    name            TEXT NOT NULL,        -- 'Cashier', 'Shift lead', 'Manager'
+    description     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at      TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX uq_roles_name ON roles(organization_id, lower(name)) WHERE deleted_at IS NULL;
+
+CREATE TABLE role_permissions (   -- join: which permissions a role grants
+    id            UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    role_id       UUID NOT NULL REFERENCES roles(id),
+    permission_id UUID NOT NULL REFERENCES permissions(id),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at    TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX uq_role_permissions ON role_permissions(role_id, permission_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_role_permissions_role ON role_permissions(role_id) WHERE deleted_at IS NULL;
+
+CREATE TABLE user_roles (   -- assignment, scoped to a location
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    user_id     UUID NOT NULL REFERENCES users(id),
+    role_id     UUID NOT NULL REFERENCES roles(id),
+    location_id UUID REFERENCES locations(id),     -- NULL = all locations (org-wide)
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at  TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX uq_user_roles ON user_roles(user_id, role_id, location_id)
+    NULLS NOT DISTINCT WHERE deleted_at IS NULL;
+CREATE INDEX idx_user_roles_user ON user_roles(user_id) WHERE deleted_at IS NULL;
+
+CREATE TABLE user_permissions (   -- per-user override on top of roles
+    id            UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    user_id       UUID NOT NULL REFERENCES users(id),
+    permission_id UUID NOT NULL REFERENCES permissions(id),
+    location_id   UUID REFERENCES locations(id),    -- NULL = all locations
+    effect        TEXT NOT NULL,                    -- 'allow' | 'deny'
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at    TIMESTAMPTZ,
+    CONSTRAINT chk_user_permissions_effect CHECK (effect IN ('allow','deny'))
+);
+CREATE UNIQUE INDEX uq_user_permissions ON user_permissions(user_id, permission_id, location_id)
+    NULLS NOT DISTINCT WHERE deleted_at IS NULL;
+CREATE INDEX idx_user_permissions_user ON user_permissions(user_id) WHERE deleted_at IS NULL;
+```
+
+---
+
 ## Open items / to revisit
 - Step 9: a shared trigger to auto-maintain `updated_at` on every table.
 - Step 9: the sync/change-log layer and conflict-resolution policy.
 - Step 10: how UUIDv7 is generated (extension vs app vs PG18 native).
 - Category nesting (self-referencing `parent_id`) — only if needed later.
 - `locations` address/contact block — add when convenient.
-- **Migration ordering:** `users` (Step 8) must be created *before* `orders`,
-  `payments`, `order_status_history`, `cash_drawer_sessions`, and `cash_movements`,
-  which all reference `users(id)`.
+- **Migration ordering:** `users` must be created *before* `orders`, `payments`,
+  `order_status_history`, `cash_drawer_sessions`, and `cash_movements` (all reference
+  `users(id)`). Within Step 8: `permissions` + `roles` before `role_permissions`;
+  `users` + `roles` + `locations` before `user_roles`; `users` + `permissions` before
+  `user_permissions`.
 - Step 9: trigger to enforce `orders.subtotal_cents = sum(order_items.line_total_cents)`.
 - Step 9: trigger to enforce `orders.discount_cents = sum(order_discounts.amount_cents)`.
 - App/sync: discount eligibility (stacking, validity window, min spend) — not in schema.
@@ -772,7 +916,12 @@ CREATE INDEX idx_cash_movements_session ON cash_movements(cash_drawer_session_id
 - Deferred: denomination breakdown of the counted cash (a `cash_count_lines` child of the session) — v1 stores a single counted total.
 - Deferred: employee timeclock / labor shifts (clock in/out, hours) — separate from cash reconciliation (D25).
 - App/sync: X/Z register reports = roll up `payments` (all tender) + `cash_movements` by session.
+- App/sync: permission resolution (role grants + overrides, deny-wins) — not in schema.
+- Step 10: seed the `permissions` catalog (the fixed `key` vocabulary the app checks).
+- Security: PIN `pin_hash` needs a deterministic keyed hash (HMAC + server pepper); the pepper is deployment config, not in the DB.
+- Deferred: explicit `user_locations` membership/roster — currently implied by location-scoped `user_roles`.
+- Deferred: auth sessions/tokens, password reset, audit log of permission changes.
 
 ---
 
-*Last updated: through Step 7 (Cash drawer & shifts).*
+*Last updated: through Step 8 (Auth & permissions).*
