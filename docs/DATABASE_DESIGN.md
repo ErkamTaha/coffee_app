@@ -28,8 +28,8 @@ progresses.
 | 6 | Inventory (movement ledger) | ✅ Done |
 | 7 | Cash drawer & shifts | ✅ Done |
 | 8 | Auth & permissions | ✅ Done |
-| 9 | Cross-cutting (constraints, indexes, sync layer) | ⏳ Next |
-| 10 | Migrations & seed data | ☐ Planned |
+| 9 | Cross-cutting (constraints, indexes, sync layer) | ✅ Done |
+| 10 | Migrations & seed data | ⏳ Next |
 
 ---
 
@@ -71,6 +71,11 @@ progresses.
 | D32 | Role assignment scope | **Location-scoped** (`user_roles.location_id`, NULL = all) | A user can be manager at one shop, cashier at another. `NULLS NOT DISTINCT` partial unique keeps the org-wide assignment singular. |
 | D33 | Per-user overrides | **`user_permissions` allow/deny on top of roles; deny wins** | Grant one barista void rights without inventing a role. Location-scoped like role assignments. |
 | D34 | Enforcement boundary & join deletes | **App enforces; schema models grants. Join tables soft-delete** | Effective permission is resolved in app/sync (the DB can't know "void *this* order"). Membership rows (`role_permissions`, `user_roles`, `user_permissions`) carry `deleted_at` so *removals* sync offline, not just additions. |
+| D35 | Change tracking | **Dedicated append-only `change_log` (outbox)** | Every mutation appends an event; the central server assigns a global monotonic `seq`; terminals pull `WHERE seq > cursor`. Event `id` (UUID) makes apply idempotent. Rejected `updated_at` high-water-mark (clock-skew fragile, no operation/origin trail, awkward deletes). |
+| D36 | Conflict resolution | **Row-level LWW ordered by a Hybrid Logical Clock** | Mutable rows resolve by `updated_hlc` (higher wins; tie → higher `updated_by_terminal_id`). Append-only ledgers are **conflict-free** (union by `id`) — the real conflict surface is just concurrently-edited catalog/auth. Rejected wall-clock LWW (skew can let a stale write win) and per-field merge (complexity not yet justified). |
+| D37 | Sync clock | **HLC in the envelope: `updated_hlc` + `updated_by_terminal_id`** | `hlc = max(local_clock + 1, wall_now)`; on receive, advance local clock to ≥ what was seen → causal & skew-resistant. `updated_at` stays human wall-time; `updated_hlc` is the comparison key. |
+| D38 | Money-sum integrity | **Verify on sync, flag — don't trigger-reject** | Row-level CHECK (`total = subtotal − discount + tax`) stays in the DB; cross-row sums (`subtotal = Σ lines`, `discount = Σ order_discounts`) are recomputed on sync and mismatches written to `sync_anomalies`. Rejected hard triggers (rows arrive in separate transactions during sync; would fight the terminal-authoritative snapshot). |
+| D39 | Integrity & capture triggers | **`set_updated_at`, `log_change`, `apply_stock_movement`** | DB owns `updated_at`; change capture lives in a trigger so no code path can mutate without logging (soft-delete flows through as a `'delete'` op); `stock_balances` is maintained from the ledger. Rejected app-side logging (any missed call silently breaks sync). |
 
 ---
 
@@ -110,8 +115,9 @@ deleted_at TIMESTAMPTZ            -- NULL = alive; a timestamp = tombstoned
 - **`TIMESTAMPTZ`, never `TIMESTAMP`** — store absolute instants (UTC). A naive
   timestamp is ambiguous across time zones, which a franchise will have.
 - **`deleted_at` = soft delete.** Live-data queries filter `WHERE deleted_at IS NULL`.
-- **`updated_at`** is how the sync layer detects changed rows; kept honest by a
-  trigger (added in Step 9), not by trusting app code.
+- **`updated_at`** is human-readable wall time, kept honest by a trigger (Step 9), not
+  by trusting app code. Step 9 also adds **`updated_hlc`** + **`updated_by_terminal_id`**
+  to this envelope — a Hybrid Logical Clock that is the actual conflict-resolution key.
 
 ### Location scoping
 - Business/transactional tables carry `location_id UUID NOT NULL REFERENCES locations(id)`.
@@ -894,10 +900,133 @@ CREATE INDEX idx_user_permissions_user ON user_permissions(user_id) WHERE delete
 
 ---
 
+## Step 9 — Cross-cutting: integrity & the sync engine
+
+Two jobs: make the invariants **self-enforcing** (triggers), and build the **change-tracking +
+conflict-resolution** layer the whole offline-first design was shaped around.
+
+### Why the sync problem is small (the payoff of the ledger discipline)
+Append-only tables — `stock_movements`, `cash_movements`, `payments`, `order_status_history`
+— **cannot conflict.** Two terminals each append a row; on sync both rows exist and the
+`SUM` is correct regardless of arrival order. *Conflict-free by construction.* Genuine
+merge conflicts only exist for **mutable entities** edited in two places at once (mostly
+catalog/pricing and auth, which are largely edited centrally). The conflict surface is
+deliberately tiny — that is the reward for Steps 4–8.
+
+### Envelope extension — the logical clock (D36, D37)
+LWW needs a tiebreak key that survives clock skew, so every enveloped table gains:
+```sql
+ALTER TABLE products
+    ADD COLUMN updated_hlc            BIGINT NOT NULL DEFAULT 0,   -- packed Hybrid Logical Clock
+    ADD COLUMN updated_by_terminal_id UUID REFERENCES terminals(id);
+CREATE INDEX idx_products_hlc ON products(updated_hlc);
+-- ...repeated for every enveloped table (org/location/catalog/orders/discounts/inventory/auth)
+```
+`updated_at` stays human wall-time; **`updated_hlc`** is the comparison key.
+`hlc = max(local_clock + 1, wall_now)`; on receiving a remote row a node advances its clock
+to ≥ what it saw, so causality holds and a lagging clock can't wrongly win.
+
+### Triggers (D39)
+```sql
+-- 1. The DB owns updated_at — never trust the client for the sync clock
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_set_updated_at BEFORE UPDATE ON products
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();   -- ...per enveloped table
+
+-- 2. Automatic change capture — no code path can forget to log
+CREATE OR REPLACE FUNCTION log_change() RETURNS trigger AS $$
+DECLARE op TEXT;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        op := 'insert';
+    ELSIF NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL THEN
+        op := 'delete';                         -- soft-delete tombstone
+    ELSE
+        op := 'update';
+    END IF;
+    INSERT INTO change_log(entity_table, row_id, operation, row_hlc,
+                           origin_terminal_id, payload)
+    VALUES (TG_TABLE_NAME, NEW.id, op, NEW.updated_hlc,
+            NEW.updated_by_terminal_id, to_jsonb(NEW));
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_log_change AFTER INSERT OR UPDATE ON products
+    FOR EACH ROW EXECUTE FUNCTION log_change();        -- ...per synced table
+
+-- 3. stock_balances projection, maintained from the ledger (formalizes Step 6)
+CREATE OR REPLACE FUNCTION apply_stock_movement() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO stock_balances (location_id, inventory_item_id, quantity_on_hand)
+    VALUES (NEW.location_id, NEW.inventory_item_id, NEW.quantity_delta)
+    ON CONFLICT (location_id, inventory_item_id)
+    DO UPDATE SET quantity_on_hand = stock_balances.quantity_on_hand + NEW.quantity_delta,
+                  updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_apply_stock_movement AFTER INSERT ON stock_movements
+    FOR EACH ROW EXECUTE FUNCTION apply_stock_movement();
+```
+`log_change()` is the keystone: **capture lives in the database**, so no application path
+can mutate a row without it landing in the outbox, and soft-deletes flow through the same
+trigger as a `'delete'` op (no separate delete-tracking).
+
+### Sync tables (D35, D38)
+```sql
+CREATE TABLE change_log (   -- append-only outbox; the SERVER assigns the global order
+    seq                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id                 UUID   NOT NULL DEFAULT uuid_generate_v7(),  -- event id → idempotent apply
+    entity_table       TEXT   NOT NULL,
+    row_id             UUID   NOT NULL,
+    operation          TEXT   NOT NULL,
+    row_hlc            BIGINT NOT NULL,        -- LWW key carried with the change
+    origin_terminal_id UUID,
+    payload            JSONB,                  -- row image (to_jsonb)
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_change_log_op CHECK (operation IN ('insert','update','delete'))
+);
+CREATE UNIQUE INDEX uq_change_log_event   ON change_log(id);            -- dedupe re-pushed events
+CREATE INDEX        idx_change_log_entity ON change_log(entity_table, row_id);
+
+CREATE TABLE sync_state (   -- each terminal's pull cursor
+    terminal_id     UUID PRIMARY KEY REFERENCES terminals(id),
+    last_pulled_seq BIGINT NOT NULL DEFAULT 0,
+    last_synced_at  TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE sync_anomalies (   -- verify-on-sync flags (money sums that don't reconcile)
+    id           UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    entity_table TEXT NOT NULL,
+    row_id       UUID NOT NULL,
+    kind         TEXT NOT NULL,        -- 'subtotal_mismatch' | 'discount_mismatch' | ...
+    detail       JSONB,
+    resolved_at  TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### The protocol
+1. **Write** — a local edit stamps a fresh `updated_hlc` + `updated_by_terminal_id`; the trigger appends to `change_log`.
+2. **Push** — the terminal sends pending events (keyed by `id`) to the server, which applies each idempotently and assigns the global `seq`.
+3. **Apply (LWW)** — for a mutable row the server keeps the incoming version only if `row_hlc > stored updated_hlc` (tie → higher terminal id). Append-only ledger rows insert iff the `id` is new — no conflict possible.
+4. **Pull** — the terminal requests `seq > last_pulled_seq`, applies with the same rule, advances its cursor, and bumps its HLC to ≥ what it received.
+
+**Verify-on-sync (D38):** when an order arrives, the server recomputes `Σ line_total` and
+`Σ order_discounts`; on mismatch it writes a `sync_anomalies` row for review rather than
+rejecting the sale — the frozen snapshot stays authoritative.
+
+---
+
 ## Open items / to revisit
-- Step 9: a shared trigger to auto-maintain `updated_at` on every table.
-- Step 9: the sync/change-log layer and conflict-resolution policy.
 - Step 10: how UUIDv7 is generated (extension vs app vs PG18 native).
+- Step 10: how the packed HLC (`updated_hlc`) is produced — app-side encoding `(physical_ms << N) | counter` vs a DB helper; pick alongside the UUIDv7 decision.
 - Category nesting (self-referencing `parent_id`) — only if needed later.
 - `locations` address/contact block — add when convenient.
 - **Migration ordering:** `users` must be created *before* `orders`, `payments`,
@@ -905,11 +1034,8 @@ CREATE INDEX idx_user_permissions_user ON user_permissions(user_id) WHERE delete
   `users(id)`). Within Step 8: `permissions` + `roles` before `role_permissions`;
   `users` + `roles` + `locations` before `user_roles`; `users` + `permissions` before
   `user_permissions`.
-- Step 9: trigger to enforce `orders.subtotal_cents = sum(order_items.line_total_cents)`.
-- Step 9: trigger to enforce `orders.discount_cents = sum(order_discounts.amount_cents)`.
 - App/sync: discount eligibility (stacking, validity window, min spend) — not in schema.
 - Deferred: per-location promo *targeting* (`location_discounts` link), like the catalog pattern.
-- Step 9: trigger to maintain `stock_balances` from `stock_movements` (upsert shown above).
 - App/sync: generating `sale` movements from order + recipe; voids/refunds append compensating movements.
 - Deferred: per-location recipe overrides; purchase-unit↔stock-unit conversions (e.g. case→each).
 - App/sync: compute `expected_cash_cents` at close (cash payments/refunds + cash ledger); stamp `payments.cash_drawer_session_id` at sale time.
@@ -921,7 +1047,10 @@ CREATE INDEX idx_user_permissions_user ON user_permissions(user_id) WHERE delete
 - Security: PIN `pin_hash` needs a deterministic keyed hash (HMAC + server pepper); the pepper is deployment config, not in the DB.
 - Deferred: explicit `user_locations` membership/roster — currently implied by location-scoped `user_roles`.
 - Deferred: auth sessions/tokens, password reset, audit log of permission changes.
+- App/sync: implement the push/apply/pull protocol + HLC advance rule (schema is in place; logic is client/server).
+- Ops: `change_log` retention/compaction policy once events are durably applied everywhere.
+- Deferred: per-field LWW merge (D36) if row-level loss ever bites concurrently-edited catalog rows.
 
 ---
 
-*Last updated: through Step 8 (Auth & permissions).*
+*Last updated: through Step 9 (Cross-cutting — integrity & sync engine).*
